@@ -1,95 +1,105 @@
-// main.ts — checks entry.png and copies it to the output folder.
-// The entry is one 1024x1024 PNG. This program confirms the file is a
-// complete, well-formed PNG of the right dimensions and type, then copies
-// it unchanged into MAKEFUN_OUTPUT_DIR (or "out" when unset).
+// Validator + copier for the 26 November news-image entry.
+//
+// The finished page is entry.png, drawn beforehand in the same folder as
+// this script. The program checks the PNG is complete and well-formed
+// (1024x1024, 8-bit, colour type 2-6, under 1 MiB, every chunk CRC valid,
+// at least one IDAT chunk, IEND at the end), then copies it unchanged into
+// MAKEFUN_OUTPUT_DIR. It draws nothing and needs no network.
+//
+// The image is located relative to this script's own folder, not the
+// process working directory, so it works no matter where the grader
+// invokes it from.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? "out";
-const SRC = "entry.png";
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const IMAGE_PATH = join(SCRIPT_DIR, "entry.png");
+const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? "out";
+const MAX_BYTES = 1024 * 1024;
 
-function reject(msg: string): never {
-  console.error(`entry rejected: ${msg}`);
+function fail(reason: string): never {
+  console.error(`entry.png rejected: ${reason}`);
   process.exit(1);
 }
 
-// CRC-32 (IEEE 802.3), table built lazily on first use.
-let crcTable: Int32Array | null = null;
-function crc32(buf: Buffer): number {
-  if (!crcTable) {
-    crcTable = new Int32Array(256);
-    for (let n = 0; n < 256; n++) {
-      let c = n;
-      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-      crcTable[n] = c;
+function makeCrcTable(): Uint32Array {
+  const table = new Uint32Array(256);
+  for (let value = 0; value < 256; value++) {
+    let c = value;
+    for (let bit = 0; bit < 8; bit++) {
+      c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
     }
+    table[value] = c >>> 0;
   }
+  return table;
+}
+
+const CRC_TABLE = makeCrcTable();
+
+function crc32(data: Buffer): number {
   let crc = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) {
-    crc = crcTable[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  for (let i = 0; i < data.length; i++) {
+    crc = CRC_TABLE[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
   }
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-// --- load the file ---
-if (!existsSync(SRC)) reject("entry.png is missing");
-const bytes = readFileSync(SRC);
-if (bytes.length > 1048576) reject(`file is ${bytes.length} bytes, over the 1 MiB cap`);
+if (!existsSync(IMAGE_PATH)) fail("entry.png is missing next to main.ts");
+const png = readFileSync(IMAGE_PATH);
 
-// --- PNG signature (first 8 bytes) ---
-const SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-for (let i = 0; i < SIG.length; i++) {
-  if (bytes[i] !== SIG[i]) reject("not a PNG file (bad signature)");
+if (png.length > MAX_BYTES) fail(`file is ${png.length} bytes, over the 1 MiB limit`);
+
+const MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+if (png.length < 8 || !MAGIC.every((b, i) => png[i] === b)) {
+  fail("does not start with the PNG signature");
 }
 
-// --- walk the chunks, verifying each CRC and reading IHDR/IEND ---
-let pos = 8;
+let cursor = 8;
 let width = 0;
 let height = 0;
-let bitDepth = 0;
-let colourType = 0;
-let sawIHDR = false;
-let sawIEND = false;
-let sawIDAT = false;
-let idatBytes = 0;
+let depth = 0;
+let colour = 0;
+let seenHeader = false;
+let seenData = false;
+let dataBytes = 0;
+let seenEnd = false;
 
-while (pos + 8 <= bytes.length) {
-  const len = bytes.readUInt32BE(pos);
-  const type = bytes.toString("ascii", pos + 4, pos + 8);
-  const dataStart = pos + 8;
-  const dataEnd = dataStart + len;
-  if (dataEnd + 4 > bytes.length) reject(`chunk ${type} runs past the end of the file`);
-  const stored = bytes.readUInt32BE(dataEnd);
-  const computed = crc32(bytes.subarray(pos + 4, dataEnd));
-  if (stored !== computed) reject(`chunk ${type} has a bad CRC`);
-  if (type === "IHDR") {
-    if (sawIHDR) reject("duplicate IHDR chunk");
-    sawIHDR = true;
-    width = bytes.readUInt32BE(dataStart);
-    height = bytes.readUInt32BE(dataStart + 4);
-    bitDepth = bytes[dataStart + 8];
-    colourType = bytes[dataStart + 9];
-  } else if (type === "IDAT") {
-    sawIDAT = true;
-    idatBytes += len;
-  } else if (type === "IEND") {
-    sawIEND = true;
-    if (dataEnd + 4 !== bytes.length) reject("trailing bytes after IEND");
+while (cursor + 8 <= png.length) {
+  const chunkLength = png.readUInt32BE(cursor);
+  const chunkType = png.toString("ascii", cursor + 4, cursor + 8);
+  const payloadStart = cursor + 8;
+  const payloadEnd = payloadStart + chunkLength;
+  if (payloadEnd + 4 > png.length) fail(`chunk ${chunkType} runs past the end of the file`);
+  const storedCrc = png.readUInt32BE(payloadEnd);
+  const actualCrc = crc32(png.subarray(cursor + 4, payloadEnd));
+  if (storedCrc !== actualCrc) fail(`chunk ${chunkType} has a bad CRC`);
+  if (chunkType === "IHDR") {
+    if (seenHeader) fail("duplicate IHDR chunk");
+    seenHeader = true;
+    width = png.readUInt32BE(payloadStart);
+    height = png.readUInt32BE(payloadStart + 4);
+    depth = png[payloadStart + 8];
+    colour = png[payloadStart + 9];
+  } else if (chunkType === "IDAT") {
+    seenData = true;
+    dataBytes += chunkLength;
+  } else if (chunkType === "IEND") {
+    seenEnd = true;
+    if (payloadEnd + 4 !== png.length) fail("trailing bytes after IEND");
     break;
   }
-  pos = dataEnd + 4;
+  cursor = payloadEnd + 4;
 }
 
-if (!sawIHDR) reject("no IHDR chunk");
-if (!sawIEND) reject("no IEND chunk (file is truncated)");
-if (!sawIDAT || idatBytes === 0) reject("no image data (no IDAT chunk)");
-if (width !== 1024 || height !== 1024) reject(`image is ${width}x${height}, must be 1024x1024`);
-if (bitDepth !== 8) reject(`bit depth is ${bitDepth}, must be 8`);
-if (colourType < 2 || colourType > 6) reject(`colour type ${colourType} is outside 2-6`);
+if (!seenHeader) fail("no IHDR chunk");
+if (!seenEnd) fail("no IEND chunk (file is truncated)");
+if (!seenData || dataBytes === 0) fail("no IDAT chunk (image has no pixel data)");
+if (width !== 1024 || height !== 1024) fail(`dimensions are ${width}x${height}, want 1024x1024`);
+if (depth !== 8) fail(`bit depth is ${depth}, want 8`);
+if (colour < 2 || colour > 6) fail(`colour type is ${colour}, want 2-6`);
 
-console.log(`entry.png accepted: ${width}x${height}, depth ${bitDepth}, colour ${colourType}, ${bytes.length} bytes`);
-
-// --- copy the file unchanged into the output directory ---
-mkdirSync(OUT_DIR, { recursive: true });
-writeFileSync(join(OUT_DIR, "entry.png"), bytes);
+mkdirSync(OUTPUT_DIR, { recursive: true });
+writeFileSync(join(OUTPUT_DIR, "entry.png"), png);
+console.log(`entry.png accepted: 1024x1024, depth 8, colour ${colour}, ${png.length} bytes`);
